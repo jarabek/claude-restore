@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Desktop-launcher wrapper for claude-restore. Adds a double-click guard and
+# reports the outcome as a notification, since the launcher has no terminal.
+set -uo pipefail
+
+APP="Claude Restore"
+ICON="$HOME/.local/share/icons/claude-restore.svg"
+LOCK="/tmp/claude-restore-desktop.$(id -u).lock"
+BIN="$HOME/.local/bin/claude-restore"
+
+note() { notify-send -a "$APP" -i "$ICON" "$APP" "$1" 2>/dev/null || true; }
+
+exec 9>"$LOCK" 2>/dev/null || exit 0
+if ! flock -n 9; then
+    note "Already restoring. Give it a moment."
+    exit 0
+fi
+
+if [ ! -x "$BIN" ]; then
+    note "claude-restore is not installed at $BIN"
+    exit 1
+fi
+
+read -r n live < <("$BIN" --json 2>/dev/null | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print(len(d.get("candidates", [])), len(d.get("live", [])))
+except Exception:
+    print(0, 0)
+' 2>/dev/null) || { n=0; live=0; }
+
+if [ "${n:-0}" -eq 0 ]; then
+    note "Nothing to restore. ${live:-0} session(s) already running."
+    exit 0
+fi
+
+note "Restoring $n session(s)..."
+"$BIN" -y >/dev/null 2>&1
+note "Restored $n session(s)."
+sleep 3   # hold the lock briefly so a second click is swallowed

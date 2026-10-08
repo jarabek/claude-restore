@@ -1,0 +1,628 @@
+#!/usr/bin/env python3
+"""Relaunch Claude Code sessions that were open when the terminal, desktop
+session, or machine went away.
+
+Reads the registry written by ~/.claude/hooks/session-registry.sh. A recorded
+session is a restore candidate whenever its process is not running now, which
+covers a reboot, a kernel panic, a GNOME session restart, and a terminal that
+was killed. The boot id guards against a recycled pid looking alive.
+
+Entries that cannot be restored are moved to the registry's .retired/ folder
+rather than offered again: sessions that never got a prompt (nothing to
+resume), and sessions whose last restore never started. An unreadable entry is
+rebuilt from its transcript and the events log.
+"""
+
+import argparse
+import contextlib
+import fcntl
+import json
+import os
+import pathlib
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+
+REG = pathlib.Path(os.environ.get("CLAUDE_SESSION_REGISTRY",
+                                  pathlib.Path.home() / ".claude/open-sessions"))
+BOOT = pathlib.Path("/proc/sys/kernel/random/boot_id")
+PROJECTS = pathlib.Path.home() / ".claude/projects"
+DIM, BOLD, RESET = "\033[2m", "\033[1m", "\033[0m"
+RESTORE_GRACE = 120  # seconds a launched session has to register itself
+
+
+@contextlib.contextmanager
+def registry_lock():
+    """The same lock the hook takes, so neither sees a half-written entry."""
+    with open(REG / ".lock", "a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        yield
+
+
+def now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def log_event(sid, msg):
+    try:
+        with open(REG / ".events.log", "a") as fh:
+            fh.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {'claude-restore':17} "
+                     f"{sid[:8]} {'-':8} pid=-        {msg}\n")
+    except OSError:
+        pass
+
+
+def write_entry(path, e):
+    tmp = path.with_name(f".{path.stem}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps({k: v for k, v in e.items() if not k.startswith("_")},
+                              indent=2) + "\n")
+    tmp.replace(path)
+
+
+def retire(path, sid, why):
+    dest = REG / ".retired"
+    dest.mkdir(exist_ok=True)
+    path.replace(dest / path.name)
+    log_event(sid, f"retired: {why}")
+
+
+def current_boot():
+    try:
+        return BOOT.read_text().strip()
+    except OSError:
+        return ""
+
+
+def proc_starttime(pid):
+    try:
+        s = pathlib.Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    # comm (field 2) may contain spaces and parens; fields resume after it.
+    rest = s[s.rindex(") ") + 2:].split()
+    return rest[19] if len(rest) > 19 else None
+
+
+def is_running(entry, boot):
+    """True only if this exact claude process is alive right now."""
+    if not entry.get("boot_id") or entry["boot_id"] != boot:
+        return False  # recorded under a different boot; its pid means nothing
+    pid = entry.get("pid") or 0
+    if pid <= 1 or not pathlib.Path(f"/proc/{pid}").exists():
+        return False
+    try:
+        if pathlib.Path(f"/proc/{pid}/comm").read_text().strip() != "claude":
+            return False
+    except OSError:
+        return False
+    recorded = entry.get("pid_starttime")
+    if recorded and proc_starttime(pid) != recorded:
+        return False
+    return True
+
+
+def _text(msg):
+    c = msg.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return " ".join(b.get("text", "") for b in c
+                        if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+def _usable(t):
+    t = (t or "").strip()
+    skip = ("<", "Caveat:", "This session is being continued",
+            "Please continue the conversation")
+    if not t or t.startswith(skip):
+        return None
+    return " ".join(t.split())
+
+
+def prompts(path):
+    """First and most recent real user prompt from a transcript."""
+    first = last = None
+    try:
+        p = pathlib.Path(path)
+        size = p.stat().st_size
+        with p.open("rb") as fh:
+            head = fh.read(min(size, 512 * 1024)).splitlines()
+            if size > 512 * 1024:
+                fh.seek(max(0, size - 512 * 1024))
+                tail = fh.read().splitlines()[1:]
+            else:
+                tail = []
+    except OSError:
+        return None, None
+
+    def scan(lines):
+        out = []
+        for raw in lines:
+            try:
+                d = json.loads(raw)
+            except Exception:
+                continue
+            if d.get("type") != "user" or d.get("isMeta"):
+                continue
+            if not isinstance(d.get("message"), dict):
+                continue
+            t = _usable(_text(d["message"]))
+            if t:
+                out.append(t)
+        return out
+
+    h = scan(head)
+    if h:
+        first, last = h[0], h[-1]
+    t = scan(tail)
+    if t:
+        last = t[-1]
+    return first, last
+
+
+def ago(ts):
+    if not ts:
+        return "unknown"
+    d = time.time() - ts
+    if d < 3600:
+        return f"{int(d // 60)}m ago"
+    if d < 86400:
+        return f"{int(d // 3600)}h ago"
+    return f"{int(d // 86400)}d ago"
+
+
+def _ts(v):
+    if not v:
+        return None
+    try:
+        import datetime
+        return datetime.datetime.fromisoformat(v).timestamp()
+    except Exception:
+        return None
+
+
+def classify(e, boot):
+    """live | crashed | closed. Only a dead process retires an entry, and a
+    heartbeat after an end mark means the end was spurious."""
+    if is_running(e, boot):
+        return "live"
+    ended, seen = _ts(e.get("ended_at")), _ts(e.get("last_seen"))
+    if ended and not (seen and seen > ended + 1):
+        return "closed"
+    return "crashed"
+
+
+def _last_logged(sid):
+    """(timestamp, event, reason) of the session's last start or end in the log."""
+    last = None
+    for lf in (REG / ".events.log.1", REG / ".events.log"):
+        try:
+            lines = lf.read_text(errors="ignore").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            p = line.split()
+            if len(p) >= 4 and p[2] == sid[:8] and p[1] in ("SessionStart", "SessionEnd"):
+                last = (p[0], p[1], p[3])
+    return last
+
+
+def _transcript_cwd(path):
+    """The directory the session was launched from. --resume looks a session up
+    by that directory's project folder, and a session can cd elsewhere later, so
+    prefer the cwd that encodes to the folder holding the transcript."""
+    path = pathlib.Path(path)
+    first = None
+    try:
+        with open(path, errors="ignore") as fh:
+            for line in fh:
+                if '"cwd"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                cwd = d.get("cwd") if isinstance(d, dict) else None
+                if not cwd:
+                    continue
+                if encode_project(cwd) == path.parent.name:
+                    return cwd
+                first = first or cwd
+    except OSError:
+        pass
+    return first
+
+
+def rebuild(f):
+    """Reconstruct an unreadable entry from its transcript and the events log.
+    Returns the entry, or None when there is nothing to rebuild from."""
+    sid = f.stem
+    hits = list(PROJECTS.glob(f"*/{sid}.jsonl"))
+    if not hits:
+        return None
+    tp = hits[0]
+    cwd = _transcript_cwd(tp)
+    if not cwd:
+        return None
+    e = {"session_id": sid, "cwd": cwd, "transcript_path": str(tp), "pid": 0,
+         "pid_starttime": "", "boot_id": "", "terminal_tab": "", "source": "rebuilt",
+         "recorded_at": now_iso(), "ended_at": None, "end_reason": None}
+    seen = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(tp.stat().st_mtime))
+    # A session still running holds its scratch dir open; claim its identity.
+    for pr in live_claude_procs():
+        if _sid_from_fds(pr["pid"]) == sid:
+            e.update(pid=pr["pid"], pid_starttime=pr["starttime"], boot_id=current_boot())
+            break
+    else:
+        last = _last_logged(sid)
+        if last and last[1] == "SessionEnd":
+            e["ended_at"] = seen = last[0]
+            e["end_reason"] = last[2]
+    e["last_seen"] = seen
+    return e
+
+
+def load(keep_closed_days=7):
+    boot = current_boot()
+    live, crashed, closed, notes = [], [], [], []
+    now = time.time()
+    with registry_lock():
+        for f in sorted(REG.glob("*.json")):
+            try:
+                e = json.loads(f.read_text())
+                if not isinstance(e, dict) or not e.get("session_id"):
+                    raise ValueError
+            except Exception:
+                e = rebuild(f)
+                if e is None:
+                    retire(f, f.stem, "unreadable, no transcript to rebuild from")
+                    notes.append(f"{f.stem[:8]}: unreadable and no transcript; retired")
+                    continue
+                write_entry(f, e)
+                log_event(f.stem, "rebuilt unreadable entry")
+                notes.append(f"{f.stem[:8]}: entry was unreadable; rebuilt from transcript")
+            e["_file"] = f
+            try:
+                e["_mtime"] = pathlib.Path(e.get("transcript_path") or "").stat().st_mtime
+            except OSError:
+                e["_mtime"] = None
+            kind = classify(e, boot)
+            if kind == "closed":
+                ended = _ts(e.get("ended_at")) or 0
+                if ended and now - ended > keep_closed_days * 86400:
+                    f.unlink(missing_ok=True)
+                    continue
+                closed.append(e)
+            elif kind == "live":
+                live.append(e)
+            elif never_used(e):
+                retire(f, e["session_id"], "never used, nothing to resume")
+                notes.append(f"{e['session_id'][:8]}: never used; retired")
+            elif _ts(e.get("restore_attempted_at")):
+                # A launched session re-registers at once, which clears this mark.
+                if now - _ts(e["restore_attempted_at"]) < RESTORE_GRACE:
+                    continue  # launch in flight
+                retire(f, e["session_id"], "restore was launched but never started")
+                notes.append(f"{e['session_id'][:8]}: last restore never started; retired")
+            else:
+                crashed.append(e)
+    for lst in (crashed, closed):
+        lst.sort(key=lambda e: e.get("_mtime") or 0, reverse=True)
+    return live, crashed, closed, notes
+
+
+def describe(e):
+    home = str(pathlib.Path.home())
+    cwd = e.get("cwd") or "?"
+    short = cwd.replace(home, "~", 1) if cwd.startswith(home) else cwd
+    first, last = prompts(e.get("transcript_path") or "")
+    return short, first, last
+
+
+def show_notes(notes):
+    for n in notes:
+        print(f"{DIM}note:{RESET} {n}")
+    if notes:
+        print(f"{DIM}Retired entries are kept in {REG / '.retired'}{RESET}\n")
+
+
+def show(dead, live, closed=0, label="recorded but not running"):
+    extra = f", {closed} closed cleanly (--all)" if closed else ""
+    print(f"{BOLD}{len(dead)} session(s) {label}{RESET}"
+          f"{DIM}  ({len(live)} still live{extra}){RESET}\n")
+    for i, e in enumerate(dead, 1):
+        short, first, last = describe(e)
+        print(f"{BOLD}{i:2}.{RESET} {short}   {DIM}{ago(e.get('_mtime'))}{RESET}")
+        if first:
+            print(f"    {DIM}opened:{RESET} {first[:110]}")
+        if last and last != first:
+            print(f"    {DIM}latest:{RESET} {last[:110]}")
+        print(f"    {DIM}{e['session_id']}{RESET}")
+
+
+def never_used(e):
+    """True when the session has no transcript content to resume."""
+    tp = e.get("transcript_path") or ""
+    try:
+        return pathlib.Path(tp).stat().st_size < 512
+    except OSError:
+        return True
+
+
+def claude_bin():
+    return shutil.which("claude") or str(pathlib.Path.home() / ".local/bin/claude")
+
+
+def mark_attempted(entries):
+    """Stamp each entry before launch. The resumed session's SessionStart hook
+    rewrites the entry and drops the stamp; one that survives the grace period
+    means the launch never produced a session, and load() retires it."""
+    at = now_iso()
+    with registry_lock():
+        for e in entries:
+            f = e["_file"]
+            try:
+                cur = json.loads(f.read_text())
+            except Exception:
+                continue
+            cur["restore_attempted_at"] = at
+            write_entry(f, cur)
+
+
+def launch(entries, windows=False):
+    cb = claude_bin()
+    term = shutil.which("gnome-terminal")
+    if not term:
+        print("gnome-terminal not found; run these yourself:", file=sys.stderr)
+        for e in entries:
+            print(f"  (cd {shlex.quote(e['cwd'])} && {cb} --resume {e['session_id']})")
+        return 1
+    mark_attempted(entries)
+    # gnome-terminal treats "--" as the end of option parsing, so a single
+    # invocation cannot carry more than one command. One invocation per tab.
+    for n, e in enumerate(entries):
+        run = f"{shlex.quote(cb)} --resume {shlex.quote(e['session_id'])}"
+        inner = f"{run}; exec bash -i"
+        where = "--window" if (windows or n == 0) else "--tab"
+        subprocess.Popen([term, where, f"--working-directory={e['cwd']}",
+                          "--", "bash", "-lc", inner],
+                         start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.6 if n == 0 else 0.35)
+    print(f"Launched {len(entries)} session(s).")
+    return 0
+
+
+def encode_project(cwd):
+    import re
+    return re.sub(r"[/.]", "-", cwd)
+
+
+def live_claude_procs():
+    out = []
+    uid = os.getuid()
+    for d in pathlib.Path("/proc").iterdir():
+        if not d.name.isdigit():
+            continue
+        try:
+            if d.stat().st_uid != uid:
+                continue
+            if (d / "comm").read_text().strip() != "claude":
+                continue
+            out.append({"pid": int(d.name),
+                        "cwd": os.readlink(d / "cwd"),
+                        "starttime": proc_starttime(int(d.name))})
+        except OSError:
+            continue
+    return out
+
+
+def _boot_epoch():
+    for line in pathlib.Path("/proc/stat").read_text().splitlines():
+        if line.startswith("btime"):
+            return int(line.split()[1])
+    return 0
+
+
+def _sid_from_fds(pid):
+    """A session's scratch dir is named by its session id; claude may hold it open."""
+    import re
+    fd = pathlib.Path(f"/proc/{pid}/fd")
+    pat = re.compile(r"/tmp/claude-\d+/[^/]+/([0-9a-f-]{36})(?:/|$)")
+    try:
+        for f in fd.iterdir():
+            m = pat.search(os.readlink(f))
+            if m:
+                return m.group(1)
+    except OSError:
+        pass
+    return None
+
+
+def adopt(dry):
+    """Record sessions that were already running before the hook existed."""
+    boot, bepoch = current_boot(), _boot_epoch()
+    hz = os.sysconf("SC_CLK_TCK")
+    known = {f.stem for f in REG.glob("*.json")}
+    procs = live_claude_procs()
+    claimed, plan = set(known), []
+
+    for pr in procs:
+        sid = _sid_from_fds(pr["pid"])
+        if sid and sid not in claimed:
+            plan.append((pr, sid, "exact (open fd)"))
+            claimed.add(sid)
+            pr["_done"] = True
+
+    for pr in procs:
+        if pr.get("_done"):
+            continue
+        started = bepoch + int(pr["starttime"] or 0) / hz
+        proj = encode_project(pr["cwd"])
+        best = None
+        for base in pathlib.Path("/tmp").glob("claude-*"):
+            pd = base / proj
+            if not pd.is_dir():
+                continue
+            for sd in pd.iterdir():
+                if not sd.is_dir() or sd.name in claimed:
+                    continue
+                try:
+                    delta = sd.stat().st_mtime - started
+                except OSError:
+                    continue
+                # A session's scratch dir is created as it launches. Anything
+                # outside a tight window is a different (usually exited) session.
+                if not -120 <= delta <= 180:
+                    continue
+                if best is None or abs(delta) < abs(best[0]):
+                    best = (delta, sd.name)
+        if best:
+            plan.append((pr, best[1], f"inferred (scratch dir {best[0]:+.0f}s from launch)"))
+            claimed.add(best[1])
+        else:
+            plan.append((pr, None, "no match"))
+
+    if not plan:
+        print("No running claude processes found.")
+        return 0
+    home = str(pathlib.Path.home())
+    for pr, sid, how in plan:
+        cwd = pr["cwd"].replace(home, "~", 1)
+        print(f"pid {pr['pid']:>8}  {cwd}\n            {sid or '(unmatched)'}  {DIM}{how}{RESET}")
+    if dry:
+        print("\nDry run. Re-run without -n to write these.")
+        return 0
+    n = 0
+    for pr, sid, _ in plan:
+        if not sid or sid in known:
+            continue
+        proj = encode_project(pr["cwd"])
+        tp = pathlib.Path.home() / ".claude/projects" / proj / f"{sid}.jsonl"
+        (REG / f"{sid}.json").write_text(json.dumps({
+            "session_id": sid, "cwd": pr["cwd"], "transcript_path": str(tp),
+            "pid": pr["pid"], "pid_starttime": pr["starttime"], "boot_id": boot,
+            "terminal_tab": "", "source": "adopted",
+            "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}, indent=2) + "\n")
+        n += 1
+    print(f"\nAdopted {n} session(s) into the registry.")
+    return 0
+
+
+def parse_sel(raw, n):
+    out = []
+    for part in raw.replace(" ", ",").split(","):
+        if not part:
+            continue
+        if "-" in part:
+            a, _, b = part.partition("-")
+            try:
+                out += list(range(int(a), int(b) + 1))
+            except ValueError:
+                return None
+        else:
+            try:
+                out.append(int(part))
+            except ValueError:
+                return None
+    return [i for i in out if 1 <= i <= n] or None
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--list", action="store_true", help="list candidates, launch nothing")
+    ap.add_argument("--check", action="store_true",
+                    help="one quiet line if candidates exist (for a shell rc)")
+    ap.add_argument("-y", "--yes", action="store_true", help="restore all without asking")
+    ap.add_argument("-n", "--dry-run", action="store_true", help="print the commands only")
+    ap.add_argument("--select", metavar="LIST", help="restore only these, e.g. 1,3,5-7")
+    ap.add_argument("--forget", metavar="LIST", help="drop these from the registry")
+    ap.add_argument("--all", action="store_true",
+                    help="also offer sessions that were closed cleanly")
+    ap.add_argument("--adopt", action="store_true",
+                    help="record already-running sessions (pre-dating the hook)")
+    ap.add_argument("--windows", action="store_true",
+                    help="one window each instead of tabs in one window")
+    ap.add_argument("--json", action="store_true", help="machine-readable dump")
+    a = ap.parse_args()
+
+    if not REG.exists():
+        print(f"No registry at {REG}", file=sys.stderr)
+        return 1
+    if a.adopt:
+        return adopt(a.dry_run)
+    live, crashed, closed, notes = load()
+    resumable = [e for e in closed if not never_used(e)]
+    dead = crashed + resumable if a.all else crashed
+
+    if a.check:
+        if dead:
+            print(f"{len(dead)} Claude session(s) were open before the last "
+                  f"shutdown. Run: claude-restore")
+        return 0
+    if a.json:
+        for e in (live + crashed + closed):
+            e.pop("_file", None)
+        print(json.dumps({"live": live, "candidates": dead,
+                          "crashed": crashed, "closed": closed, "notes": notes},
+                         indent=2, default=str))
+        return 0
+    show_notes(notes)
+    if not dead:
+        extra = f" {len(closed)} closed cleanly (--all to see them)." if closed else ""
+        print(f"Nothing to restore. {len(live)} session(s) currently live.{extra}")
+        return 0
+
+    show(dead, live, 0 if a.all else len(closed))
+
+    if a.forget:
+        sel = parse_sel(a.forget, len(dead))
+        if not sel:
+            print("Bad --forget list.", file=sys.stderr)
+            return 2
+        for i in sel:
+            dead[i - 1]["_file"].unlink(missing_ok=True)
+        print(f"\nForgot {len(sel)} entr(y/ies).")
+        return 0
+    if a.list:
+        return 0
+
+    if a.select:
+        sel = parse_sel(a.select, len(dead))
+        if not sel:
+            print("Bad --select list.", file=sys.stderr)
+            return 2
+        chosen = [dead[i - 1] for i in sel]
+    elif a.yes or a.dry_run:
+        chosen = dead
+    elif not sys.stdin.isatty():
+        print("\nNot a terminal. Re-run with -y or --select.")
+        return 0
+    else:
+        ans = input(f"\nRestore all {len(dead)}? [y/N or numbers like 1,3,5-7]: ").strip()
+        if ans.lower() in ("y", "yes", "a", "all"):
+            chosen = dead
+        elif not ans or ans.lower() in ("n", "no"):
+            print("Nothing launched. The registry is unchanged.")
+            return 0
+        else:
+            sel = parse_sel(ans, len(dead))
+            if not sel:
+                print("Did not understand that.", file=sys.stderr)
+                return 2
+            chosen = [dead[i - 1] for i in sel]
+
+    if a.dry_run:
+        cb = claude_bin()
+        for e in chosen:
+            print(f"(cd {shlex.quote(e['cwd'])} && {cb} --resume {e['session_id']})")
+        return 0
+    return launch(chosen, windows=a.windows)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

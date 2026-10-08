@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Claude Restore
+GenericName=Reopen Claude Code sessions
+Comment=Relaunch the Claude Code sessions that were open before the last reboot or crash
+Exec=@BIN@/claude-restore-desktop
+Icon=@ICON@
+Terminal=false
+Categories=Development;Utility;
+Keywords=claude;restore;session;resume;terminal;
+StartupNotify=true

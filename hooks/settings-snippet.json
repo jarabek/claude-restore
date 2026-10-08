@@ -1,0 +1,25 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "bash $HOME/.claude/hooks/session-registry.sh", "timeout": 10 }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          { "type": "command", "command": "bash $HOME/.claude/hooks/session-registry.sh", "timeout": 10 }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "bash $HOME/.claude/hooks/session-registry.sh", "timeout": 10, "async": true }
+        ]
+      }
+    ]
+  }
+}
