@@ -18,6 +18,11 @@
 # first process and either one exiting marked the session ended while the
 # other was still running. The entry now lists every process holding the
 # session in .holders, and SessionEnd marks it ended only when none is left.
+#
+# A reboot or shutdown closes the terminals cleanly, so every session gets a
+# SessionEnd with reason "other", the same as closing a tab. v4 marked them
+# all ended and nothing was offered after the reboot. An end that arrives while
+# the system is shutting down now leaves the entry open.
 set -uo pipefail
 
 REG="${CLAUDE_SESSION_REGISTRY:-$HOME/.claude/open-sessions}"
@@ -75,6 +80,12 @@ now=$(date -Is)
 boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
 stime=$(starttime_of "$cpid")
 
+shutting_down() {
+  [ "$(timeout 1 systemctl is-system-running 2>/dev/null)" = stopping ] && return 0
+  timeout 1 busctl get-property org.freedesktop.login1 /org/freedesktop/login1 \
+    org.freedesktop.login1.Manager PreparingForShutdown 2>/dev/null | grep -q true
+}
+
 valid() { jq -e 'type == "object" and (.session_id | type == "string")' "$1" >/dev/null 2>&1; }
 
 self=$(jq -nc --argjson pid "${cpid:-0}" --arg stime "${stime:-}" --arg boot "${boot:-}" \
@@ -126,7 +137,9 @@ case "$event" in
     # Mark, never delete. Whether the session really ended is decided later by
     # whether the process is actually gone.
     others=$(other_holders)
-    if [ "$others" != "[]" ]; then
+    if shutting_down; then
+      log "system shutting down; left open"
+    elif [ "$others" != "[]" ]; then
       # Still open elsewhere: hand the entry to the newest remaining holder.
       commit --argjson o "$others" \
         '.holders = $o | .pid = $o[-1].pid | .pid_starttime = $o[-1].stime

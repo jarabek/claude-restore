@@ -67,6 +67,13 @@ with the result.
 
 - Closing the terminal window is fine. Claude Code still runs `SessionEnd`
   (reason `other`), so the session is recorded as closed and isn't restored.
+- A reboot or shutdown closes the terminals just as cleanly, so the hook leaves
+  the entry open when `SessionEnd` arrives while the system is shutting down
+  (`systemctl is-system-running` is `stopping`, or logind is preparing for
+  shutdown). As a fallback, `claude-restore` treats an `other` end in the last
+  minute of an earlier boot (from `journalctl --list-boots`) as a crash.
+- A session open in two terminals is recorded with both processes, and is only
+  marked ended when the last one exits.
 - The `UserPromptSubmit` hook runs async, so calls for the same session can
   overlap. Writes go through a registry lock and a unique temp file that must
   hold a valid entry before it replaces the old one. An earlier version shared

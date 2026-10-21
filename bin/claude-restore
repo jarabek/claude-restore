@@ -193,13 +193,33 @@ def _ts(v):
         return None
 
 
-def classify(e, boot):
+SHUTDOWN_WINDOW = 60  # seconds before a boot's last journal entry
+
+
+def boot_ends():
+    """{boot id: epoch of its last journal entry}, for earlier boots."""
+    try:
+        out = subprocess.run(["journalctl", "--list-boots", "-o", "json"],
+                             capture_output=True, text=True, timeout=5).stdout
+        return {b["boot_id"]: b["last_entry"] / 1e6 for b in json.loads(out)}
+    except Exception:
+        return {}
+
+
+def classify(e, boot, ends=None):
     """live | crashed | closed. Only a dead process retires an entry, and a
-    heartbeat after an end mark means the end was spurious."""
+    heartbeat after an end mark means the end was spurious. A reboot closes
+    terminals cleanly, so an end in the last minute of an earlier boot counts
+    as a crash; the hook should already have left it open."""
     if is_running(e, boot):
         return "live"
     ended, seen = _ts(e.get("ended_at")), _ts(e.get("last_seen"))
     if ended and not (seen and seen > ended + 1):
+        bid = (e.get("boot_id") or "").replace("-", "")
+        last = (ends or {}).get(bid) if bid != boot.replace("-", "") else None
+        if (last and e.get("end_reason") == "other"
+                and last - SHUTDOWN_WINDOW <= ended <= last):
+            return "crashed"
         return "closed"
     return "crashed"
 
@@ -275,7 +295,7 @@ def rebuild(f):
 
 
 def load(keep_closed_days=7):
-    boot = current_boot()
+    boot, ends = current_boot(), boot_ends()
     live, crashed, closed, notes = [], [], [], []
     now = time.time()
     with registry_lock():
@@ -298,7 +318,7 @@ def load(keep_closed_days=7):
                 e["_mtime"] = pathlib.Path(e.get("transcript_path") or "").stat().st_mtime
             except OSError:
                 e["_mtime"] = None
-            kind = classify(e, boot)
+            kind = classify(e, boot, ends)
             if kind == "closed":
                 ended = _ts(e.get("ended_at")) or 0
                 if ended and now - ended > keep_closed_days * 86400:
