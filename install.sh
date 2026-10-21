@@ -16,8 +16,10 @@ SETTINGS="$HOME/.claude/settings.json"
 for dep in python3 jq flock; do
   command -v "$dep" >/dev/null || { echo "missing dependency: $dep" >&2; exit 1; }
 done
-for opt in gnome-terminal notify-send; do
-  command -v "$opt" >/dev/null || echo "note: $opt not found; launching and notifications need it"
+command -v tilix >/dev/null || command -v gnome-terminal >/dev/null ||
+  echo "note: neither tilix nor gnome-terminal found; launching needs one"
+for opt in xprop notify-send; do
+  command -v "$opt" >/dev/null || echo "note: $opt not found; desktop placement and notifications need it"
 done
 
 place() {  # place <source in repo> <target>

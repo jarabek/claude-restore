@@ -88,6 +88,21 @@ shutting_down() {
 
 valid() { jq -e 'type == "object" and (.session_id | type == "string")' "$1" >/dev/null 2>&1; }
 
+# The desktop of the focused window, when that window is a terminal. A prompt
+# is typed into the focused window, so this is the session's desktop, and
+# claude-restore reopens the session there. Empty when it can't tell.
+focused_desktop() {
+  [ -n "${DISPLAY:-}" ] && command -v xprop >/dev/null || return 0
+  local win
+  win=$(timeout 1 xprop -root _NET_ACTIVE_WINDOW 2>/dev/null |
+        sed -n 's/.*# \(0x[0-9a-f]*\).*/\1/p')
+  [ -n "$win" ] && [ "$win" != 0x0 ] || return 0
+  timeout 1 xprop -id "$win" WM_CLASS 2>/dev/null | grep -qiE 'tilix|gnome-terminal' || return 0
+  timeout 1 xprop -id "$win" _NET_WM_DESKTOP 2>/dev/null | sed -n 's/.* = \([0-9]*\)$/\1/p'
+}
+
+recorded_desktop() { jq -r '.desktop // empty' "$entry" 2>/dev/null; }
+
 self=$(jq -nc --argjson pid "${cpid:-0}" --arg stime "${stime:-}" --arg boot "${boot:-}" \
   'if $pid > 1 then [{pid: $pid, stime: $stime, boot: $boot}] else [] end')
 
@@ -118,16 +133,18 @@ commit() {
   return 1
 }
 
-write_full() {  # write_full <holders other than this process, JSON array>
+write_full() {  # write_full <holders other than this process, JSON array> [desktop]
   local tab
   tab=$(tr '\0' '\n' < "/proc/$cpid/environ" 2>/dev/null |
         sed -n 's/^GNOME_TERMINAL_SCREEN=//p' | head -1)
   commit -n --arg sid "$sid" --arg cwd "$cwd" --arg tp "$tpath" \
         --arg boot "${boot:-}" --arg tab "${tab:-}" --arg src "${src:-}" \
         --argjson pid "${cpid:-0}" --arg stime "${stime:-}" --arg at "$now" \
+        --arg desk "${2:-}" \
         --argjson holders "$(jq -nc --argjson o "${1:-[]}" --argjson s "$self" '$o + $s')" \
     '{session_id:$sid, cwd:$cwd, transcript_path:$tp, pid:$pid,
       pid_starttime:$stime, boot_id:$boot, terminal_tab:$tab,
+      desktop:(if $desk == "" then null else ($desk | tonumber) end),
       source:$src, recorded_at:$at, last_seen:$at,
       ended_at:null, end_reason:null, holders:$holders}'
 }
@@ -160,26 +177,31 @@ case "$event" in
   UserPromptSubmit)
     # Heartbeat: proves the session is alive, heals any spurious end mark, and
     # refreshes the process identity so a rebuilt entry counts as live.
+    desk=$(focused_desktop)
     if valid "$entry"; then
       commit --arg at "$now" --argjson pid "${cpid:-0}" \
-             --arg boot "${boot:-}" --arg stime "${stime:-}" \
+             --arg boot "${boot:-}" --arg stime "${stime:-}" --arg desk "${desk:-}" \
              --argjson h "$(jq -nc --argjson o "$(other_holders)" --argjson s "$self" '$o + $s')" \
         '.last_seen = $at | .ended_at = null | .end_reason = null
+         | if $desk != "" then .desktop = ($desk | tonumber) else . end
          | if $pid > 1 then .pid = $pid | .boot_id = $boot | .pid_starttime = $stime
                             | .holders = $h
            else . end' "$entry"
     else
       [ -e "$entry" ] && msg="rebuilt unreadable entry from heartbeat" ||
         msg="recreated from heartbeat"
-      write_full
+      write_full "[]" "$desk"
       log "$msg"
     fi
     ;;
   *)
     # A second process resuming an open session joins its holders rather than
     # replacing the first.
+    # A restored session starts before its window reaches its desktop, so a
+    # desktop already on record wins over the focused one.
     others=$(other_holders)
-    write_full "$others"
+    desk=$(recorded_desktop)
+    write_full "$others" "${desk:-$(focused_desktop)}"
     if [ "$others" = "[]" ]; then
       log "registered"
     else

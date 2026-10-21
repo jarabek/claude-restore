@@ -15,15 +15,20 @@ rebuilt from its transcript and the events log.
 
 import argparse
 import contextlib
+import ctypes
+import ctypes.util
 import fcntl
 import json
+import math
 import os
 import pathlib
+import re
 import shlex
 import shutil
 import subprocess
 import sys
 import time
+import uuid
 
 REG = pathlib.Path(os.environ.get("CLAUDE_SESSION_REGISTRY",
                                   pathlib.Path.home() / ".claude/open-sessions"))
@@ -365,7 +370,9 @@ def show(dead, live, closed=0, label="recorded but not running"):
           f"{DIM}  ({len(live)} still live{extra}){RESET}\n")
     for i, e in enumerate(dead, 1):
         short, first, last = describe(e)
-        print(f"{BOLD}{i:2}.{RESET} {short}   {DIM}{ago(e.get('_mtime'))}{RESET}")
+        d = e.get("desktop")
+        where = f", desktop {d + 1}" if isinstance(d, int) else ""
+        print(f"{BOLD}{i:2}.{RESET} {short}   {DIM}{ago(e.get('_mtime'))}{where}{RESET}")
         if first:
             print(f"    {DIM}opened:{RESET} {first[:110]}")
         if last and last != first:
@@ -402,15 +409,22 @@ def mark_attempted(entries):
             write_entry(f, cur)
 
 
-def launch(entries, windows=False):
+def default_terminal():
+    return "tilix" if shutil.which("tilix") else "gnome-terminal"
+
+
+def launch(entries, windows=False, terminal=None):
     cb = claude_bin()
-    term = shutil.which("gnome-terminal")
-    if not term:
-        print("gnome-terminal not found; run these yourself:", file=sys.stderr)
+    terminal = terminal or default_terminal()
+    if not shutil.which(terminal):
+        print(f"{terminal} not found; run these yourself:", file=sys.stderr)
         for e in entries:
             print(f"  (cd {shlex.quote(e['cwd'])} && {cb} --resume {e['session_id']})")
         return 1
     mark_attempted(entries)
+    if terminal == "tilix":
+        return launch_tilix(entries, cb)
+    term = shutil.which(terminal)
     # gnome-terminal treats "--" as the end of option parsing, so a single
     # invocation cannot carry more than one command. One invocation per tab.
     for n, e in enumerate(entries):
@@ -423,6 +437,167 @@ def launch(entries, windows=False):
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(0.6 if n == 0 else 0.35)
     print(f"Launched {len(entries)} session(s).")
+    return 0
+
+
+# ---- Tilix: one window per desktop, a grid of panes, each resuming a session.
+
+TILIX_LAYOUTS = pathlib.Path.home() / ".config/tilix/claude-restore"
+
+
+def xprop(*args):
+    try:
+        return subprocess.run(["xprop", *args], capture_output=True, text=True,
+                              timeout=3).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def x_windows(cls):
+    out = xprop("-root", "_NET_CLIENT_LIST").split("#", 1)[-1]
+    return [w for w in re.findall(r"0x[0-9a-f]+", out)
+            if f'"{cls}"' in xprop("-id", w, "WM_CLASS")]
+
+
+def x_cardinal(prop, win=None):
+    out = xprop("-id", win, prop) if win else xprop("-root", prop)
+    m = re.search(r"= (\d+)", out)
+    return int(m.group(1)) if m else None
+
+
+def workarea():
+    m = re.search(r"= (\d+), (\d+), (\d+), (\d+)", xprop("-root", "_NET_WORKAREA"))
+    return (int(m.group(3)), int(m.group(4))) if m else (1920, 1080)
+
+
+def desktop_names():
+    try:
+        out = subprocess.run(["gsettings", "get", "org.gnome.desktop.wm.preferences",
+                              "workspace-names"], capture_output=True, text=True).stdout
+        return re.findall(r"'([^']*)'", out)
+    except OSError:
+        return []
+
+
+class _XClientMessage(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int), ("serial", ctypes.c_ulong),
+                ("send_event", ctypes.c_int), ("display", ctypes.c_void_p),
+                ("window", ctypes.c_ulong), ("message_type", ctypes.c_ulong),
+                ("format", ctypes.c_int), ("data", ctypes.c_long * 5)]
+
+
+class _XEvent(ctypes.Union):
+    _fields_ = [("xclient", _XClientMessage), ("pad", ctypes.c_long * 24)]
+
+
+def move_to_desktop(win, desktop):
+    """Ask the window manager to move a window (EWMH _NET_WM_DESKTOP)."""
+    lib = ctypes.util.find_library("X11")
+    if not lib:
+        return
+    x = ctypes.CDLL(lib)
+    x.XOpenDisplay.restype = ctypes.c_void_p
+    x.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x.XDefaultRootWindow.restype = ctypes.c_ulong
+    x.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+    x.XInternAtom.restype = ctypes.c_ulong
+    x.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+    x.XSendEvent.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int,
+                             ctypes.c_long, ctypes.POINTER(_XEvent)]
+    x.XFlush.argtypes = [ctypes.c_void_p]
+    x.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    dpy = x.XOpenDisplay(None)
+    if not dpy:
+        return
+    ev = _XEvent()
+    ev.xclient.type = 33  # ClientMessage
+    ev.xclient.send_event = 1
+    ev.xclient.window = int(win, 16)
+    ev.xclient.message_type = x.XInternAtom(dpy, b"_NET_WM_DESKTOP", 0)
+    ev.xclient.format = 32
+    ev.xclient.data[0] = desktop
+    ev.xclient.data[1] = 2  # source: pager
+    mask = (1 << 20) | (1 << 19)  # SubstructureRedirect | SubstructureNotify
+    x.XSendEvent(dpy, x.XDefaultRootWindow(dpy), 0, mask, ctypes.byref(ev))
+    x.XFlush(dpy)
+    x.XCloseDisplay(dpy)
+
+
+def tilix_profile():
+    out = subprocess.run(["gsettings", "get", "com.gexperts.Tilix.ProfilesList",
+                          "default"], capture_output=True, text=True).stdout
+    return out.strip().strip("'")
+
+
+def _split(nodes, orientation, span):
+    """Binary-split nodes into a Paned tree. Tilix stores each divider's
+    position as a percentage of the whole window, not of the parent pane."""
+    if len(nodes) == 1:
+        return nodes[0]
+    k = math.ceil(len(nodes) / 2)
+    frac = k / len(nodes)
+    return {"type": "Paned", "orientation": orientation,
+            "position": round(frac * span * 100), "ratio": frac,
+            "child1": _split(nodes[:k], orientation, span * frac),
+            "child2": _split(nodes[k:], orientation, span * (1 - frac))}
+
+
+def tilix_layout(name, entries, cb):
+    profile = tilix_profile()
+    panes = []
+    for e in entries:
+        run = f"{shlex.quote(cb)} --resume {shlex.quote(e['session_id'])}; exec bash -i"
+        panes.append({"type": "Terminal", "uuid": str(uuid.uuid4()), "profile": profile,
+                      "directory": e["cwd"], "overrideCommand": f"bash -lc {shlex.quote(run)}",
+                      "readOnly": False, "synchronizedInput": False})
+    rows = max(1, math.isqrt(len(panes)))
+    per, extra = divmod(len(panes), rows)
+    grid, i = [], 0
+    for r in range(rows):
+        n = per + (1 if r < extra else 0)
+        grid.append(_split(panes[i:i + n], 0, 1.0))  # 0: side by side
+        i += n
+    width, height = workarea()
+    return {"version": "1.0", "type": "Session", "name": name, "uuid": str(uuid.uuid4()),
+            "synchronizedInput": False, "width": width, "height": height,
+            "child": _split(grid, 1, 1.0)}  # 1: stacked
+
+
+def launch_tilix(entries, cb):
+    """One maximized Tilix window per recorded desktop. Sessions with no desktop
+    on record go to the current one. Desktops are filled in order because GNOME's
+    dynamic workspaces only exist once the one before them has a window."""
+    current = x_cardinal("_NET_CURRENT_DESKTOP") or 0
+    groups = {}
+    for e in entries:
+        d = e.get("desktop")
+        groups.setdefault(d if isinstance(d, int) else current, []).append(e)
+    names = desktop_names()
+    TILIX_LAYOUTS.mkdir(parents=True, exist_ok=True)
+    for d, group in sorted(groups.items()):
+        name = names[d] if d < len(names) and names[d] else f"Desktop {d + 1}"
+        path = TILIX_LAYOUTS / f"desktop-{d + 1}.json"
+        path.write_text(json.dumps(tilix_layout(name, group, cb), indent=2) + "\n")
+        before = set(x_windows("tilix"))
+        subprocess.Popen(["tilix", "-s", str(path), "--maximize"], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        win = None
+        for _ in range(150):
+            time.sleep(0.1)
+            new = [w for w in x_windows("tilix") if w not in before]
+            if new:
+                win = new[0]
+                break
+        placed = None
+        if win:
+            count = x_cardinal("_NET_NUMBER_OF_DESKTOPS") or 1
+            move_to_desktop(win, min(d, count - 1))
+            time.sleep(0.5)
+            placed = x_cardinal("_NET_WM_DESKTOP", win)
+        where = (f"desktop {placed + 1}" if placed is not None
+                 else "a window that could not be found to place")
+        print(f"{name}: {len(group)} session(s) on {where}")
+    print(f"Launched {len(entries)} session(s) in Tilix. Layouts: {TILIX_LAYOUTS}")
     return 0
 
 
@@ -575,8 +750,10 @@ def main():
                     help="also offer sessions that were closed cleanly")
     ap.add_argument("--adopt", action="store_true",
                     help="record already-running sessions (pre-dating the hook)")
+    ap.add_argument("--terminal", choices=("tilix", "gnome-terminal"),
+                    help="where to reopen sessions (default: tilix if installed)")
     ap.add_argument("--windows", action="store_true",
-                    help="one window each instead of tabs in one window")
+                    help="gnome-terminal: one window each instead of tabs in one window")
     ap.add_argument("--json", action="store_true", help="machine-readable dump")
     a = ap.parse_args()
 
@@ -652,7 +829,7 @@ def main():
         for e in chosen:
             print(f"(cd {shlex.quote(e['cwd'])} && {cb} --resume {e['session_id']})")
         return 0
-    return launch(chosen, windows=a.windows)
+    return launch(chosen, windows=a.windows, terminal=a.terminal)
 
 
 if __name__ == "__main__":

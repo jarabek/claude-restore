@@ -15,8 +15,12 @@ window that got killed. Linux, GNOME Terminal.
    restore candidate when its process is no longer running. The boot id and
    process start time stop a recycled pid from looking alive. A `SessionEnd`
    only marks an entry; a later prompt from the same session clears the mark.
-3. **It reopens them** as tabs in a GNOME Terminal window, each running
-   `claude --resume <id>` from the directory the session was started in.
+3. **It reopens them**, each running `claude --resume <id>` from the directory
+   the session was started in. With Tilix installed, that is one maximized
+   Tilix window per GNOME desktop, laid out as a grid, on the desktop the
+   session was last used from (the hook records the focused terminal's desktop
+   at each prompt). Without Tilix, or with `--terminal gnome-terminal`, it is
+   tabs in a GNOME Terminal window.
 
 Entries that can't be restored are moved to `~/.claude/open-sessions/.retired/`
 instead of being offered again and again:
@@ -31,8 +35,9 @@ Every hook call and every retirement is appended to
 
 ## Install
 
-Needs `python3`, `jq`, `flock`, `gnome-terminal`, and `notify-send` for the
-desktop launcher.
+Needs `python3`, `jq`, `flock`, `tilix` or `gnome-terminal`, `xprop` (X11) to
+record and restore desktops, and `notify-send` for the desktop launcher. Tilix
+windows are named from GNOME's `workspace-names` setting when it is set.
 
 ```sh
 git clone https://github.com/jarabek/claude-restore.git
