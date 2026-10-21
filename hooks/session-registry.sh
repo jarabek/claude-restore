@@ -12,6 +12,12 @@
 # runs async, and v2 shared one fixed temp name per entry, so overlapping
 # invocations could rename a truncated file into place. jq turns an empty
 # input into an empty output, so such an entry then stayed empty for good.
+#
+# One session can be open in several processes at once (resumed in a second
+# terminal). v3 kept a single pid per entry, so a second resume replaced the
+# first process and either one exiting marked the session ended while the
+# other was still running. The entry now lists every process holding the
+# session in .holders, and SessionEnd marks it ended only when none is left.
 set -uo pipefail
 
 REG="${CLAUDE_SESSION_REGISTRY:-$HOME/.claude/open-sessions}"
@@ -71,6 +77,25 @@ stime=$(starttime_of "$cpid")
 
 valid() { jq -e 'type == "object" and (.session_id | type == "string")' "$1" >/dev/null 2>&1; }
 
+self=$(jq -nc --argjson pid "${cpid:-0}" --arg stime "${stime:-}" --arg boot "${boot:-}" \
+  'if $pid > 1 then [{pid: $pid, stime: $stime, boot: $boot}] else [] end')
+
+# The entry's holders, other than this process, that are still running. An
+# entry from before .holders existed has just its own pid.
+other_holders() {
+  local pid st bt keep=()
+  valid "$entry" || { printf '[]'; return; }
+  while IFS=$'\t' read -r pid st bt; do
+    [ "$pid" -gt 1 ] 2>/dev/null && [ "$pid" != "$cpid" ] && [ "$bt" = "$boot" ] || continue
+    [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = claude ] || continue
+    [ -z "$st" ] || [ "$(starttime_of "$pid")" = "$st" ] || continue
+    keep+=("$(jq -nc --argjson pid "$pid" --arg st "$st" --arg bt "$bt" \
+      '{pid: $pid, stime: $st, boot: $bt}')")
+  done < <(jq -r '(.holders // [{pid, stime: .pid_starttime, boot: .boot_id}])[]
+                  | [.pid // 0, .stime // "", .boot // ""] | @tsv' "$entry" 2>/dev/null)
+  printf '%s\n' "${keep[@]}" | jq -sc 'map(select(. != null))' 2>/dev/null || printf '[]'
+}
+
 # Run jq into a fresh temp file and install it only if it holds a valid entry.
 commit() {
   local tmp
@@ -82,26 +107,34 @@ commit() {
   return 1
 }
 
-write_full() {
+write_full() {  # write_full <holders other than this process, JSON array>
   local tab
   tab=$(tr '\0' '\n' < "/proc/$cpid/environ" 2>/dev/null |
         sed -n 's/^GNOME_TERMINAL_SCREEN=//p' | head -1)
   commit -n --arg sid "$sid" --arg cwd "$cwd" --arg tp "$tpath" \
         --arg boot "${boot:-}" --arg tab "${tab:-}" --arg src "${src:-}" \
         --argjson pid "${cpid:-0}" --arg stime "${stime:-}" --arg at "$now" \
+        --argjson holders "$(jq -nc --argjson o "${1:-[]}" --argjson s "$self" '$o + $s')" \
     '{session_id:$sid, cwd:$cwd, transcript_path:$tp, pid:$pid,
       pid_starttime:$stime, boot_id:$boot, terminal_tab:$tab,
       source:$src, recorded_at:$at, last_seen:$at,
-      ended_at:null, end_reason:null}'
+      ended_at:null, end_reason:null, holders:$holders}'
 }
 
 case "$event" in
   SessionEnd)
     # Mark, never delete. Whether the session really ended is decided later by
     # whether the process is actually gone.
-    if valid "$entry"; then
+    others=$(other_holders)
+    if [ "$others" != "[]" ]; then
+      # Still open elsewhere: hand the entry to the newest remaining holder.
+      commit --argjson o "$others" \
+        '.holders = $o | .pid = $o[-1].pid | .pid_starttime = $o[-1].stime
+         | .boot_id = $o[-1].boot' "$entry"
+      log "closed here, still open in pid $(jq -r 'map(.pid) | join(",")' <<<"$others"); not marked"
+    elif valid "$entry"; then
       commit --arg at "$now" --arg r "${src:-other}" \
-        '.ended_at = $at | .end_reason = $r' "$entry"
+        '.ended_at = $at | .end_reason = $r | .holders = []' "$entry"
       log "marked ended (reason=${src:-other})"
     elif [ -e "$entry" ]; then
       write_full && commit --arg at "$now" --arg r "${src:-other}" \
@@ -117,8 +150,10 @@ case "$event" in
     if valid "$entry"; then
       commit --arg at "$now" --argjson pid "${cpid:-0}" \
              --arg boot "${boot:-}" --arg stime "${stime:-}" \
+             --argjson h "$(jq -nc --argjson o "$(other_holders)" --argjson s "$self" '$o + $s')" \
         '.last_seen = $at | .ended_at = null | .end_reason = null
          | if $pid > 1 then .pid = $pid | .boot_id = $boot | .pid_starttime = $stime
+                            | .holders = $h
            else . end' "$entry"
     else
       [ -e "$entry" ] && msg="rebuilt unreadable entry from heartbeat" ||
@@ -128,8 +163,15 @@ case "$event" in
     fi
     ;;
   *)
-    write_full
-    log "registered"
+    # A second process resuming an open session joins its holders rather than
+    # replacing the first.
+    others=$(other_holders)
+    write_full "$others"
+    if [ "$others" = "[]" ]; then
+      log "registered"
+    else
+      log "registered, also open in pid $(jq -r 'map(.pid) | join(",")' <<<"$others")"
+    fi
     ;;
 esac
 exit 0

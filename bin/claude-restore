@@ -85,11 +85,11 @@ def proc_starttime(pid):
     return rest[19] if len(rest) > 19 else None
 
 
-def is_running(entry, boot):
+def _proc_alive(pid, starttime, entry_boot, boot):
     """True only if this exact claude process is alive right now."""
-    if not entry.get("boot_id") or entry["boot_id"] != boot:
+    if not entry_boot or entry_boot != boot:
         return False  # recorded under a different boot; its pid means nothing
-    pid = entry.get("pid") or 0
+    pid = pid or 0
     if pid <= 1 or not pathlib.Path(f"/proc/{pid}").exists():
         return False
     try:
@@ -97,10 +97,19 @@ def is_running(entry, boot):
             return False
     except OSError:
         return False
-    recorded = entry.get("pid_starttime")
-    if recorded and proc_starttime(pid) != recorded:
+    if starttime and proc_starttime(pid) != starttime:
         return False
     return True
+
+
+def is_running(entry, boot):
+    """True if any process holding the session is alive. One session can be
+    open in several terminals; the hook lists them all in holders."""
+    if _proc_alive(entry.get("pid"), entry.get("pid_starttime"),
+                   entry.get("boot_id"), boot):
+        return True
+    return any(_proc_alive(h.get("pid"), h.get("stime"), h.get("boot"), boot)
+               for h in entry.get("holders") or [] if isinstance(h, dict))
 
 
 def _text(msg):
@@ -294,6 +303,7 @@ def load(keep_closed_days=7):
                 ended = _ts(e.get("ended_at")) or 0
                 if ended and now - ended > keep_closed_days * 86400:
                     f.unlink(missing_ok=True)
+                    log_event(e["session_id"], f"deleted: closed over {keep_closed_days} days")
                     continue
                 closed.append(e)
             elif kind == "live":
@@ -586,6 +596,7 @@ def main():
             return 2
         for i in sel:
             dead[i - 1]["_file"].unlink(missing_ok=True)
+            log_event(dead[i - 1]["session_id"], "deleted: --forget")
         print(f"\nForgot {len(sel)} entr(y/ies).")
         return 0
     if a.list:
